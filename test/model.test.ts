@@ -1,543 +1,490 @@
-// Tests for the token radar's model (lib/model.ts): the implied-value formula, the farm
-// plans, the board builder, the snapshot parser and the board gate. Every expectation
-// below is computed from the model's own stated constants, not from a run's output:
-// a test that only repeats what the code printed would prove nothing.
-//
-// Run: node --test test/model.test.ts (Node 22.18+; the file imports no test dependency).
-
-import test from 'node:test';
+// radar-3 model tests: the fitted curve, the tilts, the universe rules, the farm economics,
+// the board, the validation and the gate. Run with: node --test test/model.test.ts
+import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
-  MODEL,
   MODEL_VERSION,
-  EARLY_ROWS,
-  LIVE_ROWS,
-  SnapshotError,
   ageDays,
+  bandAndRankRange,
+  cheapestChain,
+  curveValue,
+  farmEcon,
+  farmSteps,
+  fitCurve,
+  fitPoints,
+  gasUsd,
+  growthMult,
+  holdDaysFor,
   impliedValue,
   isPreToken,
   isRankable,
-  buildBoard,
-  liveRows,
-  radarRow,
-  buildRadar,
-  parseSnapshot,
-  boardIssue,
-  dataScript,
-  farmSteps,
+  maturityMult,
+  ols,
+  setAsideReason,
   stepText,
-} from '../lib/model.ts';
-import type { Snapshot, SnapshotProtocol } from '../lib/model.ts';
+  stopRuleFor,
+  tradedStems,
+} from '../dashboard/model.js';
+import { boardIssue, buildBoard, buildRadar, dataScript, liveRows, parseSnapshot, radarRow } from '../lib/board.ts';
+import { bootstrapRefits, looCheck, rankCorr, timeSplitCheck } from '../lib/validate.ts';
 
-/** One protocol, with the fields a test cares about overridden. */
-function makeProtocol(overrides: Partial<SnapshotProtocol> = {}): SnapshotProtocol {
+const here = dirname(fileURLToPath(import.meta.url));
+const realSnapshotPath = join(here, '..', '..', 'token-radar-01-kit', 'input', 'snapshot.json');
+
+function approx(actual, expected, tol = 1e-6) {
+  assert.ok(Math.abs(actual - expected) <= tol, `expected ${actual} to be within ${tol} of ${expected}`);
+}
+
+/** One protocol record, with the fields the model reads. */
+function protocol(overrides = {}) {
   return {
-    slug: 'proto',
-    name: 'Protocol',
-    category: 'DEX',
-    chains: ['ethereum'],
+    slug: 'test-protocol',
+    name: 'Test Protocol',
+    category: 'Lending',
+    chains: ['arbitrum'],
     tvl_usd: 100_000_000,
     change_7d: 0,
     mcap_usd: null,
-    listed_at: '2020-01-01',
+    listed_at: '2024-01-01',
     gecko_id: null,
     symbol: null,
     ...overrides,
   };
 }
 
-/** One snapshot document, with the fields a test cares about overridden. */
-function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
-  return {
-    as_of: '2026-11-14',
-    source: 'test',
-    floor_usd: 50_000_000,
-    protocols: [],
-    watchlist: [],
-    ...overrides,
-  };
+/** A snapshot document from protocol records. */
+function snapshot(protocols, watchlist = []) {
+  return { as_of: '2026-11-14', source: 'test', floor_usd: 50_000_000, protocols, watchlist };
 }
 
-test('ageDays counts whole days and clamps the future to zero', () => {
-  assert.equal(ageDays('2026-11-14', '2026-11-14'), 0);
-  assert.equal(ageDays('2026-11-14', '2026-11-04'), 10);
-  assert.equal(ageDays('2024-03-01', '2024-02-28'), 2);
-  assert.equal(ageDays('2026-11-14', null), null);
-  assert.equal(ageDays('2026-11-14', 'not-a-date'), null);
-  assert.equal(ageDays('2026-11-14', '2026-11-20'), 0);
-});
-
-test('ageDays counts a long-lived protocol in thousands of days', () => {
-  const age = ageDays('2026-11-14', '2020-01-01');
-  assert.ok(age !== null && age > 2000, `expected age over 2000 days, got ${age}`);
-});
-
-test('impliedValue: a billion TVL, no growth, old protocol is exactly a quarter of TVL', () => {
-  const p = makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 0, listed_at: '2020-01-01' });
-  const v = impliedValue(p, '2026-11-14', MODEL);
-  assert.equal(v.implied, 250_000_000);
-  assert.equal(v.growthPct, 0);
-  assert.equal(v.growthMult, 1);
-  assert.equal(v.maturityMult, 1);
-  assert.equal(v.sizeMult, 1);
-  assert.ok(v.age !== null && v.age > 1095);
-});
-
-test('impliedValue: growth of +10% adds nine percent, not ten', () => {
-  const p = makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 10, listed_at: '2020-01-01' });
-  const v = impliedValue(p, '2026-11-14', MODEL);
-  assert.equal(v.growthPct, 10);
-  assert.equal(v.growthMult, 1.09);
-  assert.equal(v.implied, 272_500_000);
-});
-
-test('impliedValue: a fall of 10% costs fourteen percent, more than the rise gains', () => {
-  const up = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 10, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  const down = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: -10, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.equal(down.growthMult, 0.86);
-  assert.equal(down.implied, 215_000_000);
-  assert.ok(up.implied + down.implied < 2 * 250_000_000, 'downside must weigh more than upside');
-});
-
-test('impliedValue: growth is clamped to +60% and to -50%', () => {
-  const spike = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 100, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.equal(spike.growthPct, 60);
-  assert.equal(spike.growthMult, 1.54);
-  assert.equal(spike.implied, 385_000_000);
-  const crash = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: -80, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.equal(crash.growthPct, -50);
-  assert.ok(Math.abs(crash.growthMult - 0.3) < 1e-9, `expected growthMult 0.3, got ${crash.growthMult}`);
-  assert.equal(crash.implied, 75_000_000);
-});
-
-test('impliedValue: a missing seven-day change counts as no change', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: null, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.equal(v.growthPct, 0);
-  assert.equal(v.implied, 250_000_000);
-});
-
-test('impliedValue: a 30-day-old protocol is discounted to 55% by maturity', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 0, listed_at: '2026-10-15' }), '2026-11-14', MODEL);
-  assert.equal(v.age, 30);
-  assert.equal(v.maturityMult, 0.55);
-  assert.equal(v.implied, 137_500_000);
-});
-
-test('impliedValue: an unknown age is scored at the ramp midpoint, 85%', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 1_000_000_000, change_7d: 0, listed_at: null }), '2026-11-14', MODEL);
-  assert.equal(v.age, null);
-  assert.equal(v.maturityMult, 0.85);
-  assert.equal(v.implied, 212_500_000);
-});
-
-test('impliedValue: a huge protocol is clamped to the 0.8 size floor', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 20_000_000_000, change_7d: 0, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.equal(v.sizeMult, 0.8);
-  assert.equal(v.implied, 4_000_000_000);
-});
-
-test('impliedValue: a small protocol carries option value, between 19.5M and 19.7M', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 50_000_000, change_7d: 0, listed_at: '2020-01-01' }), '2026-11-14', MODEL);
-  assert.ok(v.implied > 19_500_000 && v.implied < 19_700_000, `got ${v.implied}`);
-  assert.ok(v.sizeMult > 1.5 && v.sizeMult < 1.6);
-});
-
-test('impliedValue: the implied value never falls below one dollar', () => {
-  const v = impliedValue(makeProtocol({ tvl_usd: 1, change_7d: -50, listed_at: '2026-10-15' }), '2026-11-14', MODEL);
-  assert.equal(v.implied, 1);
-});
-
-test('impliedValue: the reported age matches ageDays', () => {
-  const p = makeProtocol({ listed_at: '2023-06-01' });
-  const v = impliedValue(p, '2026-11-14', MODEL);
-  assert.equal(v.age, ageDays('2026-11-14', '2023-06-01'));
-});
-
-test('isPreToken: no market cap, no CoinGecko id and no symbol means pre-token', () => {
-  assert.equal(isPreToken(makeProtocol()), true);
-  assert.equal(isPreToken(makeProtocol({ mcap_usd: 1 })), false);
-  assert.equal(isPreToken(makeProtocol({ gecko_id: 'foo' })), false);
-  assert.equal(isPreToken(makeProtocol({ symbol: 'FOO' })), false);
-});
-
-test('isRankable: exchanges and versioned pools are kept off the board', () => {
-  assert.equal(isRankable(makeProtocol({ category: 'DEX' })), true);
-  assert.equal(isRankable(makeProtocol({ category: 'CEX' })), false);
-  assert.equal(isRankable(makeProtocol({ name: 'Foo V2' })), false);
-  assert.equal(isRankable(makeProtocol({ name: 'Foo v2.1' })), false);
-  assert.equal(isRankable(makeProtocol({ name: 'Foo 2.0' })), false);
-  assert.equal(isRankable(makeProtocol({ name: 'Foo 2' })), true);
-  assert.equal(isRankable(makeProtocol({ mcap_usd: 5_000_000 })), false);
-});
-
-test('farmSteps: six steps, each with an action, a cost and a time', () => {
-  const steps = farmSteps(makeProtocol(), 400);
-  assert.equal(steps.length, 6);
-  for (const s of steps) {
-    assert.ok(s.text.length > 0);
-    assert.ok(s.cost.length > 0);
-    assert.ok(s.time.length > 0);
+/** Traded comps lying exactly on log10(mcap) = 7.2 + 0.52 x log10(TVL / $100M). */
+function curveComps(count = 12) {
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const tvl = 10_000_000 * Math.pow(10, i / 4);
+    const mcap = Math.pow(10, 7.2 + 0.52 * Math.log10(tvl / 1e8));
+    out.push(
+      protocol({
+        slug: `comp-${i}`,
+        name: `Comp ${i}`,
+        category: 'Lending',
+        tvl_usd: Math.round(tvl),
+        mcap_usd: Math.round(mcap),
+        gecko_id: `comp-${i}`,
+        symbol: `C${i}`,
+        listed_at: i < 8 ? '2022-06-01' : '2025-03-01',
+      }),
+    );
   }
-  assert.match(steps[0]!.text, /fresh wallet/);
-  assert.match(steps[5]!.text, /farm log/);
+  return out;
+}
+
+describe('ageDays', () => {
+  test('counts whole days between listing and the snapshot date', () => {
+    assert.equal(ageDays('2026-11-14', '2025-11-14'), 365);
+    assert.equal(ageDays('2026-11-14', '2026-11-14'), 0);
+  });
+  test('null or bad listing dates give null, a future listing gives zero', () => {
+    assert.equal(ageDays('2026-11-14', null), null);
+    assert.equal(ageDays('2026-11-14', 'not-a-date'), null);
+    assert.equal(ageDays('2026-11-14', '2027-01-01'), 0);
+  });
 });
 
-test('farmSteps: the first step is always the fresh wallet, whatever the category', () => {
-  for (const category of ['Lending', 'DEX', 'Bridge', 'RWA', null]) {
-    const steps = farmSteps(makeProtocol({ category }), 400);
-    assert.match(steps[0]!.text, /fresh wallet/, `category ${category}`);
+describe('ols', () => {
+  test('recovers an exact line with R squared 1', () => {
+    const pts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((x) => ({ x, y: 2 * x + 1 }));
+    const fit = ols(pts);
+    approx(fit.a, 1);
+    approx(fit.b, 2);
+    approx(fit.r2, 1);
+    assert.equal(fit.n, 12);
+  });
+  test('refuses too few points and a degenerate x', () => {
+    assert.equal(ols([{ x: 1, y: 2 }]), null);
+    assert.equal(
+      ols(Array.from({ length: 12 }, () => ({ x: 1, y: 2 }))),
+      null,
+    );
+  });
+});
+
+describe('the fitted curve', () => {
+  const snap = snapshot(curveComps());
+  test('fitCurve recovers the curve the comps were built on', () => {
+    const fit = fitCurve(snap);
+    approx(fit.a, 7.2, 0.01);
+    approx(fit.b, 0.52, 0.01);
+    assert.equal(fit.n, 12);
+    approx(fit.r2, 1, 0.001);
+  });
+  test('fitPoints trims a comp whose multiple is outside [1/500, 50]', () => {
+    const pts = fitPoints(snap);
+    assert.equal(pts.length, 12);
+    const wild = protocol({ slug: 'wild', mcap_usd: 1, tvl_usd: 100_000_000, gecko_id: 'wild', symbol: 'W' });
+    assert.equal(fitPoints(snapshot([...curveComps(), wild])).length, 12);
+  });
+  test('curveValue is 10^a at $100M of TVL and scales with the slope', () => {
+    const fit = fitCurve(snap);
+    approx(curveValue(1e8, fit), Math.pow(10, 7.2), 1);
+    approx(curveValue(1e10, fit) / curveValue(1e8, fit), Math.pow(100, 0.52), 0.01);
+  });
+  test('CEX, bridges and versioned listings never enter the fit', () => {
+    const extra = [
+      protocol({ slug: 'cex-1', category: 'CEX', mcap_usd: 1e9, gecko_id: 'cex-1', symbol: 'CEX' }),
+      protocol({ slug: 'br-1', category: 'Cross Chain Bridge', mcap_usd: 1e9, gecko_id: 'br-1', symbol: 'BR' }),
+      protocol({ slug: 'v-1', name: 'Test V2', mcap_usd: 1e9, gecko_id: 'v-1', symbol: 'V' }),
+    ];
+    assert.equal(fitPoints(snapshot([...curveComps(), ...extra])).length, 12);
+  });
+});
+
+describe('the tilts', () => {
+  test('growthMult is 1 at zero, half the move, clamped to [0.7, 1.3]', () => {
+    assert.equal(growthMult(0), 1);
+    approx(growthMult(10), 1.05);
+    approx(growthMult(-10), 0.95);
+    assert.equal(growthMult(60), 1.3);
+    assert.equal(growthMult(100), 1.3);
+    assert.equal(growthMult(-50), 0.75);
+    // The growth floor is -50%, so the lowest tilt the formula can reach is 0.75;
+    // the 0.7 clamp floor never binds.
+    assert.equal(growthMult(-100), 0.75);
+    assert.equal(growthMult(null), 1);
+  });
+  test('maturityMult is the S-ramp: 0.55 young, 0.85 at a year, 1.0 past three years', () => {
+    assert.equal(maturityMult(0), 0.55);
+    assert.equal(maturityMult(89), 0.55);
+    assert.equal(maturityMult(365), 0.85);
+    assert.equal(maturityMult(1095), 1.0);
+    assert.equal(maturityMult(2000), 1.0);
+    assert.equal(maturityMult(null), 0.85);
+  });
+  test('impliedValue is the curve times the tilts, with a $1 floor', () => {
+    const snap = snapshot(curveComps());
+    const fit = fitCurve(snap);
+    const p = protocol({ tvl_usd: 1e8, change_7d: 0, listed_at: '2020-01-01' });
+    const v = impliedValue(p, snap.as_of, fit);
+    assert.equal(v.implied, Math.round(Math.pow(10, 7.2)));
+    assert.equal(v.growthMult, 1);
+    assert.equal(v.maturityMult, 1);
+    const up = impliedValue(protocol({ tvl_usd: 1e8, change_7d: 10, listed_at: '2020-01-01' }), snap.as_of, fit);
+    const down = impliedValue(protocol({ tvl_usd: 1e8, change_7d: -10, listed_at: '2020-01-01' }), snap.as_of, fit);
+    assert.ok(up.implied > v.implied && down.implied < v.implied);
+    const tiny = impliedValue(protocol({ tvl_usd: 1, change_7d: -50, listed_at: '2026-11-01' }), snap.as_of, fit);
+    assert.ok(tiny.implied >= 1);
+  });
+});
+
+describe('the universe rules', () => {
+  test('isPreToken needs all three token fields absent', () => {
+    assert.equal(isPreToken(protocol()), true);
+    assert.equal(isPreToken(protocol({ mcap_usd: 1 })), false);
+    assert.equal(isPreToken(protocol({ gecko_id: 'x' })), false);
+    assert.equal(isPreToken(protocol({ symbol: 'X' })), false);
+  });
+  test('setAsideReason names each exclusion', () => {
+    const stems = new Set(['zebra']);
+    assert.equal(setAsideReason(protocol({ category: 'CEX' }), stems), 'exchange');
+    assert.equal(setAsideReason(protocol({ category: 'Canonical Bridge' }), stems), 'bridge');
+    assert.equal(setAsideReason(protocol({ name: 'Test V2' }), stems), 'versioned listing');
+    assert.equal(setAsideReason(protocol({ name: 'Wrapped Ether' }), stems), 'wrapped or staked product');
+    assert.equal(setAsideReason(protocol({ name: 'Zebra Lend' }), stems), 'name shared with a traded token');
+    assert.equal(setAsideReason(protocol({ name: 'Yield Farm' }), new Set(['yield'])), null);
+    assert.equal(setAsideReason(protocol(), stems), null);
+  });
+  test('tradedStems takes distinctive first words only', () => {
+    const snap = snapshot([
+      protocol({ slug: 'a', name: 'Zebra Finance', mcap_usd: 1e8, gecko_id: 'a', symbol: 'A' }),
+      protocol({ slug: 'b', name: 'Yield Max', mcap_usd: 1e8, gecko_id: 'b', symbol: 'B' }),
+    ]);
+    const stems = tradedStems(snap);
+    assert.ok(stems.has('zebra'));
+    assert.ok(!stems.has('yield'));
+  });
+  test('isRankable exempts the watchlist and excludes the rest with a reason', () => {
+    const wl = new Set(['watch-cex']);
+    const stems = new Set();
+    assert.equal(isRankable(protocol({ slug: 'watch-cex', category: 'CEX' }), wl, stems), true);
+    assert.equal(isRankable(protocol({ slug: 'plain-cex', category: 'CEX' }), wl, stems), false);
+    assert.equal(isRankable(protocol({ slug: 'clean' }), wl, stems), true);
+    assert.equal(isRankable(protocol({ slug: 'traded', mcap_usd: 1e8, gecko_id: 't', symbol: 'T' }), wl, stems), false);
+  });
+});
+
+describe('the farm economics', () => {
+  test('gas tiers: Ethereum is dear, L2s and fast L1s are cheap', () => {
+    assert.equal(gasUsd('ethereum'), 10);
+    assert.equal(gasUsd('arbitrum'), 0.25);
+    assert.equal(gasUsd('solana'), 0.5);
+    assert.equal(gasUsd('some-new-chain'), 2);
+  });
+  test('cheapestChain picks the cheapest of the first three chains', () => {
+    assert.deepEqual(cheapestChain(protocol({ chains: ['ethereum', 'arbitrum', 'solana'] })), { chain: 'arbitrum', gasUsd: 0.25 });
+    assert.deepEqual(cheapestChain(protocol({ chains: [] })), { chain: 'its main chain', gasUsd: 2 });
+  });
+  test('holdDaysFor gives younger protocols a longer window', () => {
+    assert.equal(holdDaysFor(null), 30);
+    assert.equal(holdDaysFor(100), 60);
+    assert.equal(holdDaysFor(300), 45);
+    assert.equal(holdDaysFor(500), 30);
+  });
+  test('farmEcon nets the slice against fees and the T-bill cost', () => {
+    // TVL $100M, implied $10M, 30-day hold on Arbitrum: deposit $5,000 (a dollar pays).
+    const e = farmEcon(protocol({ chains: ['arbitrum'] }), 10_000_000, 400);
+    assert.equal(e.deposit, 5000);
+    approx(e.slice, 50);
+    approx(e.fees, 1);
+    approx(e.capitalCost, 16.44, 0.01);
+    approx(e.net, 32.56, 0.01);
+    approx(e.breakEvenOdds, 0.3488, 0.001);
+    // Break-even odds 34.9% are above the 25% THIN line, so this row is a SKIP.
+    assert.equal(e.verdict, 'SKIP');
+    assert.ok(e.minDeposit > 0 && e.minDeposit < e.deposit);
+  });
+  test('farmEcon deposits the floor and skips when a dollar does not pay', () => {
+    // A giant: implied/TVL so low the T-bill cost eats the slice.
+    const e = farmEcon(protocol({ tvl_usd: 5_000_000_000, chains: ['ethereum'] }), 60_000_000, 400);
+    assert.equal(e.deposit, 500);
+    assert.equal(e.verdict, 'SKIP');
+    assert.equal(e.minDeposit, null);
+  });
+  test('farmEcon farms a small cheap-chain protocol with a high multiple', () => {
+    const e = farmEcon(protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] }), 50_000_000, 400);
+    assert.equal(e.verdict, 'FARM');
+    assert.ok(e.net > 0 && e.perHour > 0);
+  });
+  test('stopRuleFor is twice the seven-day swing, clamped to 10-35%', () => {
+    assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: 5 })), { pct: 10, level: 90_000_000 });
+    assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: -20 })), { pct: 35, level: 65_000_000 });
+    assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: null })), { pct: 20, level: 80_000_000 });
+  });
+  test('stepText pads a short step and truncates a long one', () => {
+    assert.ok(stepText({ text: 'Do it.', cost: '$1', time: '1 minute' }).length >= 20);
+    const long = stepText({ text: 'x'.repeat(700), cost: '$1', time: '1 minute' });
+    assert.ok(long.length <= 600 && long.endsWith('...'));
+  });
+  test('farmSteps are seven dated steps, verdict first, with a stop rule', () => {
+    const e = farmEcon(protocol({ chains: ['arbitrum'] }), 10_000_000, 400);
+    const steps = farmSteps(protocol({ chains: ['arbitrum'] }), e, 400);
+    assert.equal(steps.length, 7);
+    assert.ok(steps[0].startsWith('Verdict: SKIP'));
+    assert.ok(steps.some((s) => s.includes('stop')));
+    for (const s of steps) assert.ok(s.length >= 20 && s.length <= 600, s);
+  });
+});
+
+describe('the board', () => {
+  test('buildBoard covers the watchlist, ranks 1..n in implied order, and names the set-aside', () => {
+    const watch = protocol({ slug: 'watch-1', tvl_usd: 60_000_000 });
+    const clean = protocol({ slug: 'clean-1', tvl_usd: 40_000_000 });
+    const cex = protocol({ slug: 'cex-1', category: 'CEX', tvl_usd: 30_000_000 });
+    const traded = protocol({ slug: 'traded-1', tvl_usd: 200_000_000, mcap_usd: 1e8, gecko_id: 't', symbol: 'T' });
+    const snap = snapshot([...curveComps(), watch, clean, cex, traded], ['watch-1']);
+    const fit = fitCurve(snap);
+    const { rows, setAside } = buildBoard(snap, fit);
+    const slugs = rows.map((r) => r.slug);
+    assert.ok(slugs.includes('watch-1'));
+    assert.ok(slugs.includes('clean-1'));
+    assert.ok(!slugs.includes('cex-1'));
+    assert.ok(!slugs.includes('traded-1'));
+    assert.deepEqual(
+      setAside.map((s) => s.slug),
+      ['cex-1'],
+    );
+    assert.equal(setAside[0].reason, 'exchange');
+    rows.forEach((r, i) => assert.equal(r.rank, i + 1));
+    for (let i = 1; i < rows.length; i++) assert.ok(rows[i].implied_value_usd <= rows[i - 1].implied_value_usd);
+    for (const r of rows) {
+      assert.ok(['FARM', 'THIN', 'SKIP'].includes(r.verdict));
+      assert.equal(r.farm_steps.length, 7);
+    }
+  });
+  test('buildBoard flags above-floor rows that are not on the watchlist', () => {
+    const big = protocol({ slug: 'big-1', tvl_usd: 80_000_000 });
+    const small = protocol({ slug: 'small-1', tvl_usd: 40_000_000 });
+    const snap = snapshot([...curveComps(), big, small], []);
+    const { rows } = buildBoard(snap, fitCurve(snap));
+    assert.equal(rows.find((r) => r.slug === 'big-1').above_floor, true);
+    assert.equal(rows.find((r) => r.slug === 'small-1').above_floor, false);
+  });
+  test('liveRows are the traded set by market cap, with the curve value', () => {
+    const snap = snapshot(curveComps());
+    const live = liveRows(snap, fitCurve(snap));
+    assert.equal(live.length, 12);
+    assert.ok(live[0].mcap_usd >= live[live.length - 1].mcap_usd);
+    assert.ok(live.every((r) => r.curve_value_usd > 0 && r.multiple > 0));
+  });
+  test('buildRadar accounts for every protocol in the universe', () => {
+    const snap = snapshot([...curveComps(), protocol({ slug: 'clean-1' }), protocol({ slug: 'cex-1', category: 'CEX' })], []);
+    const { board, radar } = buildRadar(snap);
+    const u = radar.universe;
+    assert.equal(u.ranked + u.set_aside + u.recorded_with_token + u.traded, snap.protocols.length);
+    assert.equal(radar.board_size, board.length);
+    assert.equal(radar.rows.length, board.length);
+    assert.equal(radar.fit_points.length, fitPoints(snap).length);
+    assert.equal(radar.model_version, MODEL_VERSION);
+    assert.equal(radar.validation, null);
+    assert.equal(radar.refits, null);
+  });
+  test('radarRow is the compact row the page renders', () => {
+    const snap = snapshot([...curveComps(), protocol({ slug: 'clean-1' })], []);
+    const { board } = buildRadar(snap);
+    const row = radarRow(board[0]);
+    assert.equal(row.slug, board[0].slug);
+    assert.equal(row.implied_value_usd, board[0].implied_value_usd);
+    assert.equal(row.econ.verdict, board[0].verdict);
+  });
+});
+
+describe('the validation', () => {
+  test('looCheck: on exact-curve data the curve predicts perfectly and the flat multiple does not', () => {
+    const snap = snapshot(curveComps());
+    const rows = looCheck(snap);
+    assert.equal(rows.length, 4);
+    const byVariant = Object.fromEntries(rows.map((r) => [r.variant, r]));
+    assert.equal(byVariant['curve'].median_miss, 1);
+    assert.equal(byVariant['curve'].within_2x, 1);
+    assert.ok(byVariant['flat'].median_miss > 2);
+    assert.ok(byVariant['flat'].within_2x < 1);
+    for (const r of rows) assert.equal(r.n, 12);
+  });
+  test('timeSplitCheck: fit before 2024, tested after, and null when either side is too small', () => {
+    const snap = snapshot(curveComps());
+    const split = timeSplitCheck(snap);
+    // With 8 pre-2024 comps the train side is too small (needs 10): null is the honest answer.
+    assert.equal(split, null);
+    const many = snapshot(curveComps(20).map((p, i) => ({ ...p, listed_at: i < 12 ? '2022-06-01' : '2025-03-01' })));
+    const split2 = timeSplitCheck(many);
+    assert.ok(split2 !== null);
+    assert.equal(split2.train_n, 12);
+    assert.equal(split2.test_n, 8);
+    assert.equal(split2.curve_median_miss, 1);
+    assert.ok(split2.flat_median_miss > 1);
+  });
+  test('rankCorr is 1 for identical orderings and -1 for reversed ones', () => {
+    assert.equal(rankCorr([1, 2, 3, 4], [1, 2, 3, 4]), 1);
+    assert.equal(rankCorr([1, 2, 3, 4], [4, 3, 2, 1]), -1);
+    assert.equal(rankCorr([1, 2], [1, 2]), null);
+  });
+  test('bootstrapRefits return 200 refits, deterministic from the seed', () => {
+    const snap = snapshot(curveComps());
+    const a = bootstrapRefits(snap);
+    const b = bootstrapRefits(snap);
+    assert.equal(a.length, 200);
+    assert.deepEqual(a, b);
+    const fit = fitCurve(snap);
+    for (const [ra, rb] of a.slice(0, 20)) {
+      assert.ok(Math.abs(ra - fit.a) < 0.5 && Math.abs(rb - fit.b) < 0.5);
+    }
+  });
+  test('bandAndRankRange bands contain the implied value and rank ranges stay in bounds', () => {
+    const snap = snapshot(curveComps());
+    const fit = fitCurve(snap);
+    const { rows } = buildBoard(snap, fit);
+    const refits = bootstrapRefits(snap);
+    const bands = bandAndRankRange(rows, refits);
+    assert.equal(bands.size, rows.length);
+    for (const r of rows) {
+      const band = bands.get(r.slug);
+      assert.ok(band.band_lo_usd <= r.implied_value_usd && r.implied_value_usd <= band.band_hi_usd);
+      assert.ok(band.rank_lo >= 1 && band.rank_hi <= rows.length && band.rank_lo <= band.rank_hi);
+    }
+  });
+});
+
+describe('the gate and the parser', () => {
+  function validBoard() {
+    const snap = snapshot([...curveComps(), protocol({ slug: 'clean-1' })], []);
+    const fit = fitCurve(snap);
+    const { rows } = buildBoard(snap, fit);
+    const refits = bootstrapRefits(snap);
+    const bands = bandAndRankRange(rows, refits);
+    for (const r of rows) {
+      const b = bands.get(r.slug);
+      r.band_lo_usd = b.band_lo_usd;
+      r.band_hi_usd = b.band_hi_usd;
+      r.rank_lo = b.rank_lo;
+      r.rank_hi = b.rank_hi;
+    }
+    return { snap, rows };
   }
-});
-
-test('farmSteps: the action follows the category', () => {
-  const cases: Array<[string | null, RegExp]> = [
-    ['Lending', /Supply \$150 of USDC/],
-    ['CDP', /Supply \$150 of USDC/],
-    ['DEX', /Provide \$150 of liquidity/],
-    ['Yield', /Provide \$150 of liquidity/],
-    ['Bridge', /Bridge \$150 of USDC/],
-    ['Staking', /Stake \$150/],
-    ['Restaking', /Stake \$150/],
-    ['Perpetual', /Deposit \$150 of USDC as margin/],
-    ['Prediction', /Fund \$150/],
-    ['Curator', /Deposit \$150 into a .* vault/],
-    ['Stablecoins', /Mint or deposit \$150/],
-    ['RWA', /Mint \$150 of the protocol's yield asset/],
-    ['Insurance', /Buy \$150 of cover/],
-    ['Something Else', /Deposit \$150 of USDC into/],
-    [null, /Deposit \$150 of USDC into/],
-  ];
-  for (const [category, pattern] of cases) {
-    const steps = farmSteps(makeProtocol({ category, tvl_usd: 1_000_000_000 }), 400);
-    assert.match(steps[1]!.text, pattern, `category ${category}`);
-  }
-});
-
-test('farmSteps: capital follows TVL in four tiers', () => {
-  const capital = (tvl: number) => farmSteps(makeProtocol({ tvl_usd: tvl, category: 'DEX' }), 400)[1]!.text;
-  assert.match(capital(5_000_000_000), /\$250/);
-  assert.match(capital(4_999_999_999), /\$150/);
-  assert.match(capital(1_000_000_000), /\$150/);
-  assert.match(capital(999_999_999), /\$100/);
-  assert.match(capital(100_000_000), /\$100/);
-  assert.match(capital(99_999_999), /\$50/);
-});
-
-test('farmSteps: gas is dear on Ethereum, cheap on L2s and fast L1s', () => {
-  const cost0 = (chain: string) => farmSteps(makeProtocol({ chains: [chain] }), 400)[0]!.cost;
-  assert.match(cost0('Ethereum'), /about \$6 to \$15 of gas/);
-  assert.match(cost0('Arbitrum'), /under \$0\.50 of gas/);
-  assert.match(cost0('Base'), /under \$0\.50 of gas/);
-  assert.match(cost0('Solana'), /under \$1 of gas/);
-  assert.match(cost0('Polygon'), /under \$1 of gas/);
-  assert.match(cost0('Frobchain'), /a few dollars of gas/);
-});
-
-test('farmSteps: the hold is longer for younger protocols', () => {
-  const hold = (age: number | null) => farmSteps(makeProtocol(), age)[3]!.text;
-  assert.match(hold(null), /at least 30 days/);
-  assert.match(hold(100), /at least 60 days/);
-  assert.match(hold(179), /at least 60 days/);
-  assert.match(hold(180), /at least 45 days/);
-  assert.match(hold(364), /at least 45 days/);
-  assert.match(hold(365), /at least 30 days/);
-});
-
-test('farmSteps: the weekly action follows the category too', () => {
-  const weekly = (category: string | null) => farmSteps(makeProtocol({ category }), 400)[2]!.text;
-  assert.match(weekly('Lending'), /Borrow a small amount against the supply/);
-  assert.match(weekly('DEX'), /highest-fee range/);
-  assert.match(weekly('Bridge'), /bridge a small amount back/);
-  assert.match(weekly('Staking'), /Restake the receipt/);
-  assert.match(weekly('RWA'), /Claim the yield distribution/);
-  assert.match(weekly('Insurance'), /renew the cover/);
-  assert.match(weekly('Unknown'), /qualifying action/);
-});
-
-test('stepText: a step reads as one line with its cost and time', () => {
-  const s = stepText({ text: 'Do the thing.', cost: '$5', time: '5 minutes' });
-  assert.equal(s, 'Do the thing. Cost: $5. Time: 5 minutes.');
-  assert.ok(s.length >= 20 && s.length <= 600);
-});
-
-test('stepText: a too-short step is padded, a too-long step is cut to 599 characters', () => {
-  const short = stepText({ text: '', cost: '', time: '' });
-  assert.ok(short.length >= 20);
-  assert.match(short, /Hold the position and check the protocol's own page/);
-  const long = stepText({ text: 'x'.repeat(700), cost: 'c', time: 't' });
-  assert.equal(long.length, 599);
-  assert.ok(long.endsWith('...'));
-});
-
-test('buildBoard: the watchlist is the floor and the early radar adds below it', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha', 'beta'],
-    protocols: [
-      makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }),
-      makeProtocol({ slug: 'beta', name: 'Beta', tvl_usd: 100_000_000 }),
-      makeProtocol({ slug: 'gamma', name: 'Gamma', tvl_usd: 40_000_000 }),
-      makeProtocol({ slug: 'delta', name: 'Delta', tvl_usd: 900_000_000, mcap_usd: 1_000_000_000, gecko_id: 'delta', symbol: 'DELTA' }),
-      makeProtocol({ slug: 'epsilon', name: 'Epsilon', category: 'CEX', tvl_usd: 800_000_000 }),
-      makeProtocol({ slug: 'zeta', name: 'Zeta V2', tvl_usd: 700_000_000 }),
-      makeProtocol({ slug: 'eta', name: 'Eta', tvl_usd: 60_000_000 }),
-    ],
+  test('boardIssue passes a valid board', () => {
+    const { snap, rows } = validBoard();
+    assert.equal(boardIssue(rows, snap), null);
   });
-  const board = buildBoard(snap);
-  assert.deepEqual(board.map((r) => r.slug), ['alpha', 'beta', 'gamma']);
-  assert.deepEqual(board.map((r) => r.rank), [1, 2, 3]);
-  for (let i = 1; i < board.length; i++) {
-    assert.ok(board[i]!.implied_value_usd <= board[i - 1]!.implied_value_usd, 'implied value must not rise with rank');
-  }
-  assert.equal(board[0]!.token_status, 'pre-token');
-  assert.equal(boardIssue(board, snap), null);
-});
-
-test('buildBoard: a protocol above the floor but off the watchlist is not added', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha'],
-    protocols: [
-      makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }),
-      makeProtocol({ slug: 'eta', name: 'Eta', tvl_usd: 60_000_000 }),
-    ],
+  test('boardIssue refuses a missing watchlist slug, a broken rank, a missing verdict and a missing band', () => {
+    const { snap, rows } = validBoard();
+    const snap2 = snapshot([...curveComps(), protocol({ slug: 'clean-1' })], ['missing-slug']);
+    assert.match(boardIssue(rows, snap2), /misses 1 watchlist slug/);
+    const broken = rows.map((r) => ({ ...r }));
+    broken[0] = { ...broken[0], rank: 99 };
+    assert.match(boardIssue(broken, snap), /rank 1 is/);
+    const noVerdict = rows.map((r) => ({ ...r }));
+    noVerdict[0] = { ...noVerdict[0], verdict: 'MAYBE' };
+    assert.match(boardIssue(noVerdict, snap), /no farm verdict/);
+    const noBand = rows.map((r) => ({ ...r }));
+    noBand[0] = { ...noBand[0], band_lo_usd: null };
+    assert.match(boardIssue(noBand, snap), /no uncertainty band/);
   });
-  const board = buildBoard(snap);
-  assert.deepEqual(board.map((r) => r.slug), ['alpha']);
-});
-
-test('buildBoard: the early radar is capped at 160 rows', () => {
-  const early = Array.from({ length: 200 }, (_, i) =>
-    makeProtocol({ slug: `early-${i}`, name: `Early ${i}`, tvl_usd: 40_000_000 - i * 1000 }),
-  );
-  const snap = makeSnapshot({ watchlist: ['alpha'], protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }), ...early] });
-  const board = buildBoard(snap);
-  assert.equal(board.length, 161);
-  assert.equal(board.filter((r) => r.slug.startsWith('early-')).length, 160);
-});
-
-test('buildBoard: a missing watchlist slug is reported by the gate, not hidden', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha', 'ghost'],
-    protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 })],
+  test('parseSnapshot takes a valid snapshot and refuses the rest', () => {
+    const snap = parseSnapshot(JSON.stringify(snapshot([protocol()], ['test-protocol'])));
+    assert.equal(snap.protocols.length, 1);
+    assert.throws(() => parseSnapshot('not json'), /not JSON/);
+    assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14' })), /no source/);
+    assert.throws(() => parseSnapshot(JSON.stringify({ ...snapshot([], []), watchlist: 'not-an-array' })), /no watchlist/);
+    assert.throws(
+      () => parseSnapshot(JSON.stringify(snapshot([{ slug: 'x' }]))),
+      /lacks a slug, a name or a TVL/,
+    );
   });
-  const board = buildBoard(snap);
-  assert.deepEqual(board.map((r) => r.slug), ['alpha']);
-  const issue = boardIssue(board, snap);
-  assert.ok(issue !== null && issue.includes('ghost'), `expected the gate to name ghost, got ${issue}`);
-});
-
-test('buildBoard: equal implied values break ties by slug', () => {
-  const snap = makeSnapshot({
-    watchlist: ['b-proto', 'a-proto'],
-    protocols: [
-      makeProtocol({ slug: 'b-proto', name: 'B', tvl_usd: 100_000_000 }),
-      makeProtocol({ slug: 'a-proto', name: 'A', tvl_usd: 100_000_000 }),
-    ],
+  test('dataScript is one window.RADAR assignment that parses', () => {
+    const { radar } = buildRadar(snapshot(curveComps()));
+    const script = dataScript(radar);
+    assert.ok(script.startsWith('window.RADAR='));
+    assert.equal(JSON.parse(script.slice('window.RADAR='.length).replace(/;\n$/, '')).board_size, radar.board_size);
   });
-  const board = buildBoard(snap);
-  assert.equal(board[0]!.implied_value_usd, board[1]!.implied_value_usd);
-  assert.deepEqual(board.map((r) => r.slug), ['a-proto', 'b-proto']);
 });
 
-test('buildBoard: every row carries its model inputs and six farm steps', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha'],
-    protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 })],
+describe('the sealed snapshot (integration, skipped when the kit is absent)', () => {
+  test('the real fit, board, universe and validation match the run', (t) => {
+    if (!existsSync(realSnapshotPath)) {
+      t.skip('kit snapshot not present');
+      return;
+    }
+    const snap = parseSnapshot(readFileSync(realSnapshotPath, 'utf8'));
+    const fit = fitCurve(snap);
+    approx(fit.a, 7.12, 0.05);
+    approx(fit.b, 0.514, 0.02);
+    assert.equal(fit.n, 97);
+    const { board, radar } = buildRadar(snap);
+    assert.equal(board.length, 225);
+    assert.equal(radar.watchlist_size, 40);
+    const u = radar.universe;
+    assert.equal(u.ranked + u.set_aside + u.recorded_with_token + u.traded, 758);
+    const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
+    for (const r of board) verdicts[r.verdict]++;
+    assert.deepEqual(verdicts, { FARM: 18, THIN: 85, SKIP: 122 });
+    const loo = looCheck(snap);
+    const byVariant = Object.fromEntries(loo.map((r) => [r.variant, r]));
+    approx(byVariant['flat'].median_miss, 5.05, 0.05);
+    approx(byVariant['curve+growth+maturity'].median_miss, 2.72, 0.05);
+    assert.ok(byVariant['curve+growth+maturity'].median_miss < byVariant['flat'].median_miss);
+    const split = timeSplitCheck(snap);
+    assert.ok(split !== null && split.curve_median_miss < split.flat_median_miss);
+    const refits = bootstrapRefits(snap);
+    assert.equal(refits.length, 200);
+    const bands = bandAndRankRange(board, refits);
+    for (const r of board) {
+      const b = bands.get(r.slug);
+      r.band_lo_usd = b.band_lo_usd;
+      r.band_hi_usd = b.band_hi_usd;
+      r.rank_lo = b.rank_lo;
+      r.rank_hi = b.rank_hi;
+    }
+    assert.equal(boardIssue(board, snap), null);
   });
-  const row = buildBoard(snap)[0]!;
-  assert.equal(row.model.base_multiple, 0.25);
-  assert.equal(typeof row.model.growth_multiplier, 'number');
-  assert.equal(typeof row.model.maturity_multiplier, 'number');
-  assert.equal(typeof row.model.size_multiplier, 'number');
-  assert.equal(row.farm_steps.length, 6);
-  for (const s of row.farm_steps) assert.ok(s.length >= 20 && s.length <= 600, `farm step of ${s.length} chars`);
-});
-
-test('liveRows: the live view is the top 24 by market cap, exchanges excluded', () => {
-  const live = Array.from({ length: 30 }, (_, i) =>
-    makeProtocol({ slug: `live-${i}`, name: `Live ${i}`, mcap_usd: (30 - i) * 1_000_000, gecko_id: `live-${i}`, symbol: `L${i}`, tvl_usd: 10_000_000 }),
-  );
-  const snap = makeSnapshot({
-    protocols: [...live, makeProtocol({ slug: 'big-cex', name: 'Big CEX', category: 'CEX', mcap_usd: 999_000_000, gecko_id: 'big-cex', symbol: 'BC' })],
-  });
-  const rows = liveRows(snap);
-  assert.equal(rows.length, 24);
-  assert.equal(rows[0]!.mcap_usd, 30_000_000);
-  assert.equal(rows[23]!.mcap_usd, 7_000_000);
-  assert.ok(!rows.some((r) => r.slug === 'big-cex'));
-  for (let i = 1; i < rows.length; i++) assert.ok((rows[i]!.mcap_usd ?? 0) <= (rows[i - 1]!.mcap_usd ?? 0));
-});
-
-test('radarRow: the compact row keeps the rank, the value and the multipliers', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha'],
-    protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 })],
-  });
-  const compact = radarRow(buildBoard(snap)[0]!);
-  assert.equal(compact.slug, 'alpha');
-  assert.equal(compact.rank, 1);
-  assert.ok(compact.implied_value_usd > 0);
-  assert.equal(typeof compact.growth_multiplier, 'number');
-  assert.equal(compact.farm_steps, undefined);
-});
-
-test('parseSnapshot: a valid document parses, with missing optionals as null', () => {
-  const snap = parseSnapshot(JSON.stringify({
-    as_of: '2026-11-14',
-    source: 'test',
-    floor_usd: 50_000_000,
-    protocols: [{ slug: 'a', name: 'A', tvl_usd: 100 }],
-    watchlist: ['a'],
-  }));
-  assert.equal(snap.as_of, '2026-11-14');
-  assert.equal(snap.protocols[0]!.category, null);
-  assert.deepEqual(snap.protocols[0]!.chains, []);
-  assert.equal(snap.protocols[0]!.change_7d, null);
-  assert.equal(snap.watchlist[0], 'a');
-});
-
-test('parseSnapshot: a full protocol round-trips every field', () => {
-  const snap = parseSnapshot(JSON.stringify({
-    as_of: '2026-11-14',
-    source: 'test',
-    floor_usd: 50_000_000,
-    protocols: [{
-      slug: 'a', name: 'A', category: 'DEX', chains: ['ethereum', 'arbitrum'],
-      tvl_usd: 123, change_7d: 4.5, mcap_usd: 999, listed_at: '2021-05-01',
-      gecko_id: 'a', symbol: 'A',
-    }],
-    watchlist: [],
-  }));
-  const p = snap.protocols[0]!;
-  assert.equal(p.category, 'DEX');
-  assert.deepEqual(p.chains, ['ethereum', 'arbitrum']);
-  assert.equal(p.change_7d, 4.5);
-  assert.equal(p.mcap_usd, 999);
-  assert.equal(p.listed_at, '2021-05-01');
-});
-
-test('parseSnapshot: malformed input is refused with SnapshotError', () => {
-  assert.throws(() => parseSnapshot('not json'), SnapshotError);
-  assert.throws(() => parseSnapshot('[]'), SnapshotError);
-  assert.throws(() => parseSnapshot('null'), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ source: 'x', floor_usd: 1, protocols: [], watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026/11/14', source: 'x', floor_usd: 1, protocols: [], watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 0, protocols: [], watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 1.5, protocols: [], watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 1, protocols: {}, watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 1, protocols: [], watchlist: [1] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 1, protocols: [{ slug: 'a', name: 'A' }], watchlist: [] })), SnapshotError);
-  assert.throws(() => parseSnapshot(JSON.stringify({ as_of: '2026-11-14', source: 'x', floor_usd: 1, protocols: [{ slug: 'a', name: 'A', tvl_usd: Number.NaN }], watchlist: [] })), SnapshotError);
-});
-
-test('boardIssue: a valid board passes every gate at once', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha', 'beta'],
-    protocols: [
-      makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }),
-      makeProtocol({ slug: 'beta', name: 'Beta', tvl_usd: 100_000_000 }),
-    ],
-  });
-  assert.equal(boardIssue(buildBoard(snap), snap), null);
-});
-
-test('boardIssue: each failure names the fault', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha', 'beta'],
-    protocols: [
-      makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }),
-      makeProtocol({ slug: 'beta', name: 'Beta', tvl_usd: 100_000_000 }),
-    ],
-  });
-  const brokenRanks = buildBoard(snap);
-  brokenRanks[0]!.rank = 2;
-  assert.match(boardIssue(brokenRanks, snap)!, /rank 1 is 2/);
-  const outOfOrder = buildBoard(snap);
-  outOfOrder[0]!.implied_value_usd = outOfOrder[1]!.implied_value_usd - 1;
-  assert.match(boardIssue(outOfOrder, snap)!, /outranks/);
-  const allSame = buildBoard(snap);
-  for (const r of allSame) r.implied_value_usd = 100;
-  assert.match(boardIssue(allSame, snap)!, /share the same implied value/);
-  const fewSteps = buildBoard(snap);
-  fewSteps[0]!.farm_steps = ['one', 'two'];
-  assert.match(boardIssue(fewSteps, snap)!, /2 farm steps/);
-  const shortStep = buildBoard(snap);
-  shortStep[0]!.farm_steps = ['tiny', 'a'.repeat(30), 'b'.repeat(30), 'c'.repeat(30), 'd'.repeat(30), 'e'.repeat(30)];
-  assert.match(boardIssue(shortStep, snap)!, /farm step of 4 characters/);
-  const zeroValue = buildBoard(snap);
-  zeroValue[zeroValue.length - 1]!.implied_value_usd = 0;
-  assert.match(boardIssue(zeroValue, snap)!, /implied value 0/);
-});
-
-test('buildRadar: the dashboard payload carries the board, the live set and the model', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha', 'beta'],
-    protocols: [
-      makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 }),
-      makeProtocol({ slug: 'beta', name: 'Beta', tvl_usd: 100_000_000 }),
-      makeProtocol({ slug: 'gamma', name: 'Gamma', tvl_usd: 40_000_000 }),
-      makeProtocol({ slug: 'delta', name: 'Delta', tvl_usd: 900_000_000, mcap_usd: 1_000_000_000, gecko_id: 'delta', symbol: 'DELTA' }),
-    ],
-  });
-  const { board, radar } = buildRadar(snap);
-  assert.equal(board.length, 3);
-  assert.equal(radar.board_size, 3);
-  assert.equal(radar.watchlist_size, 2);
-  assert.equal(radar.early_size, 1);
-  assert.equal(radar.live_size, 1);
-  assert.equal(radar.model_version, 'radar-2');
-  assert.equal(radar.as_of, '2026-11-14');
-  assert.equal(radar.floor_usd, 50_000_000);
-  assert.equal(radar.rows.length, 3);
-  assert.equal(radar.live[0]!.slug, 'delta');
-  assert.deepEqual(radar.model, MODEL);
-});
-
-test('buildRadar: a board with no early rows reports early_size zero', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha'],
-    protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 })],
-  });
-  const { radar } = buildRadar(snap);
-  assert.equal(radar.early_size, 0);
-  assert.equal(radar.live_size, 0);
-});
-
-test('dataScript: the dataset is one script that assigns window.RADAR and parses back', () => {
-  const snap = makeSnapshot({
-    watchlist: ['alpha'],
-    protocols: [makeProtocol({ slug: 'alpha', name: 'Alpha', tvl_usd: 500_000_000 })],
-  });
-  const { radar } = buildRadar(snap);
-  const script = dataScript(radar);
-  assert.ok(script.startsWith('window.RADAR='));
-  assert.ok(script.endsWith(';\n'));
-  const payload = script.slice('window.RADAR='.length, -2);
-  const parsed = JSON.parse(payload) as { model_version: string; rows: unknown[] };
-  assert.equal(parsed.model_version, 'radar-2');
-  assert.equal(parsed.rows.length, 1);
-});
-
-test('MODEL: the radar-2 constants are the ones the dashboard states', () => {
-  assert.equal(MODEL_VERSION, 'radar-2');
-  assert.equal(EARLY_ROWS, 160);
-  assert.equal(LIVE_ROWS, 24);
-  assert.equal(MODEL.base_multiple, 0.25);
-  assert.equal(MODEL.growth_up_weight, 0.9);
-  assert.equal(MODEL.growth_down_weight, 1.4);
-  assert.equal(MODEL.growth_floor, -50);
-  assert.equal(MODEL.growth_cap, 60);
-  assert.equal(MODEL.size_exponent, -0.15);
-  assert.equal(MODEL.size_ref_usd, 1_000_000_000);
-  assert.equal(MODEL.maturity_young_days, 90);
-  assert.equal(MODEL.maturity_young, 0.55);
-  assert.equal(MODEL.maturity_mid, 0.85);
-  assert.equal(MODEL.maturity_full, 1.0);
-  assert.equal(MODEL.maturity_days, 1095);
-  assert.equal(MODEL.unknown_age_days, 365);
-});
-
-test('MODEL: the downside weight is heavier than the upside weight, by design', () => {
-  assert.ok(MODEL.growth_down_weight > MODEL.growth_up_weight);
-  assert.ok(MODEL.growth_cap < 100, 'a single week never counts in full');
-  assert.ok(Math.abs(MODEL.growth_floor) < MODEL.growth_cap, 'the floor is tighter than the cap');
 });

@@ -128,7 +128,26 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 .steps b { display: block; font-weight: 500; }
 .cost { color: var(--muted); font-size: 12px; font-family: var(--font-num); }
 
-@media (max-width: 900px) {
+/* radar-3: verdict pills, traded anchors, uncertainty bands, the Method scatter. */
+.verdict { display: inline-flex; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; }
+.v-farm { background: #e3f2ec; color: #0f7a5a; }
+.v-thin { background: #fdf3d8; color: #8a6d1b; }
+.v-skip { background: #eceff0; color: #5f6f67; }
+tr.anchor { background: #f7f9f8; color: var(--muted); }
+tr.anchor:hover { background: #f7f9f8; }
+.implied { flex-wrap: wrap; }
+.band { flex-basis: 100%; color: var(--muted); font-size: 12px; font-family: var(--font-num); white-space: nowrap; }
+.anchors { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; align-self: center; }
+.scatter { margin-top: var(--step-4); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: var(--step-5); }
+.scatter svg { width: 100%; height: auto; display: block; }
+.scatter .plot { fill: #f8faf9; stroke: var(--border); }
+.scatter .fit-line { stroke: var(--accent); stroke-width: 2; fill: none; }
+.scatter .dot-fit { fill: var(--ink); }
+.scatter .dot-row { fill: var(--accent); opacity: 0.55; }
+.scatter .axis { font-size: 11px; fill: var(--muted); font-family: var(--font-body); }
+.scatter .tick { stroke: var(--border); }
+.scatter p { margin-top: var(--step-3); }
+
   .shell { padding: var(--step-4); }
   .lede { grid-template-columns: 1fr; gap: var(--step-4); }
   .facts { border-left: 0; border-top: 1px solid var(--border); padding-left: 0; padding-top: var(--step-4); }

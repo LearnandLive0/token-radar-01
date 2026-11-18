@@ -1,24 +1,29 @@
 // A working token-radar-01 entry (Node 22, standard library only).
 //
-// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// pre-token protocol with the model in lib/model.ts, writes the ranked board to /output/board.json, and
-// copies this repository's dashboard/ and screenshots/ to /output. Screenshots are stored in the
-// repository as base64 text (*.b64) and decoded into /output/screenshots at run time, because the
-// push path GitHub offers this entry carries text only. Last, it writes /output/dossier.json,
-// the summary the judge reads, with the vendored make.fun library.
+// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits
+// the value curve on the snapshot's traded tokens with the model in dashboard/model.js, writes
+// the ranked board to /output/board.json, and copies this repository's dashboard/ and
+// screenshots/ to /output. Screenshots are stored in the repository as base64 text (*.b64) and
+// decoded into /output/screenshots at run time, because the push path GitHub offers this entry
+// carries text only. Last, it writes /output/dossier.json, the summary the judge reads, with
+// the vendored make.fun library.
 //
-// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board. A starting
-// point, not a winner: it covers the watchlist, states the model and gives every protocol a farm plan.
-// Change the model, the page or the plan; keep the gate's shape.
+// The dashboard is a static page, no framework and no network: dashboard/index.html,
+// dashboard/app.css, dashboard/app.js and dashboard/model.js read /output/data.js, which this
+// program writes from the same board. The model is one file both places run: main.ts imports
+// it, the page loads it as a module and re-derives every row, so the page's numbers and the
+// board's numbers are the same arithmetic. radar-3: a runtime-fitted log-log curve, an
+// out-of-sample Method view, and every farm plan netted to a verdict in dollars.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../token-radar-01-kit/input/snapshot.json
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { bandAndRankRange } from './dashboard/model.js';
+import { boardIssue, buildRadar, dataScript, parseSnapshot, radarRow } from './lib/board.ts';
+import { bootstrapRefits, looCheck, timeSplitCheck } from './lib/validate.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -45,7 +50,24 @@ if (!existsSync(inputFile)) {
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar } = buildRadar(snapshot);
+const { board, radar, fit } = buildRadar(snapshot);
+
+// Validation and bands, computed here and shipped in data.js for the Method view: the
+// leave-one-out table and the time split prove the curve out of sample, and the bootstrap
+// refits give every row its uncertainty band and rank range.
+const refits = bootstrapRefits(snapshot);
+const bands = bandAndRankRange(board, refits);
+for (const row of board) {
+  const b = bands.get(row.slug)!;
+  row.band_lo_usd = b.band_lo_usd;
+  row.band_hi_usd = b.band_hi_usd;
+  row.rank_lo = b.rank_lo;
+  row.rank_hi = b.rank_hi;
+}
+radar.refits = refits;
+radar.validation = { loo: looCheck(snapshot), time_split: timeSplitCheck(snapshot) };
+radar.rows = board.map(radarRow);
+
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
@@ -92,8 +114,8 @@ for (const name of shotFiles) {
     shots.push(name);
   }
 }
-if (shots.length < 3) {
-  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
+if (shots.length < 4) {
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 4, the board, a detail view, a filtered view and the method view\n`);
   process.exit(1);
 }
 for (const name of shots) {
@@ -106,7 +128,10 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+const looFull = radar.validation.loo.find((r: { variant: string }) => r.variant === 'curve+growth+maturity');
+const looFlat = radar.validation.loo.find((r: { variant: string }) => r.variant === 'flat');
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside, ${radar.universe.set_aside} set aside)\n` +
+    `token radar: curve log10(mcap) = ${fit.a.toFixed(2)} + ${fit.b.toFixed(3)} x log10(TVL/$100M), n=${fit.n}, R2=${fit.r2.toFixed(3)}; LOO median miss ${looFull.median_miss}x vs flat ${looFlat.median_miss}x\n` +
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (4 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
