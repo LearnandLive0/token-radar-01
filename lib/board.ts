@@ -127,7 +127,7 @@ export function buildBoard(snapshot, fit) {
     band_hi_usd: null,
     rank_lo: null,
     rank_hi: null,
-    farm_steps: farmSteps(s.p, s.econ, s.v.age),
+    farm_steps: farmSteps(s.p, s.econ, s.v.age, s.v.implied),
   }));
   return { rows, setAside };
 }
@@ -175,6 +175,7 @@ export function radarRow(row) {
     band_hi_usd: row.band_hi_usd,
     rank_lo: row.rank_lo,
     rank_hi: row.rank_hi,
+    farm_steps: row.farm_steps,
   };
 }
 
@@ -211,6 +212,7 @@ export function buildRadar(snapshot) {
     },
     model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length,
+    watchlist: snapshot.watchlist,
     board_size: rows.length,
     early_size: early,
     live_size: live.length,

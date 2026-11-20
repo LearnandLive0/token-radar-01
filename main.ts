@@ -95,19 +95,21 @@ function copyFiles(from: string, to: string): string[] {
 
 copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
 // Screenshots ride in the repository as base64 text (*.b64): the push path GitHub offers this
-// entry is text-only, so no PNG bytes travel in the repo. Decode each one into /output/screenshots
-// under its plain name; the bytes are exactly the PNGs the dashboard was screenshotted from.
+// entry is text-only, so no image bytes travel in the repo. Decode each one into /output/screenshots
+// under its plain name; the bytes are exactly the PNGs or JPEGs the dashboard was screenshotted from.
 const shotFiles = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
 const shots: string[] = [];
 for (const name of shotFiles) {
   if (name.endsWith('.b64')) {
     const target = name.slice(0, -4);
-    const png = Buffer.from(readFileSync(join(out, 'screenshots', name), 'utf8').replace(/\s+/g, ''), 'base64');
-    if (png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
-      process.stderr.write(`token radar: screenshots/${name}: not a PNG once decoded\n`);
+    const shot = Buffer.from(readFileSync(join(out, 'screenshots', name), 'utf8').replace(/\s+/g, ''), 'base64');
+    const isPng = shot.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+    const isJpeg = shot.subarray(0, 3).toString('hex') === 'ffd8ff';
+    if (!isPng && !isJpeg) {
+      process.stderr.write(`token radar: screenshots/${name}: not a PNG or JPEG once decoded\n`);
       process.exit(1);
     }
-    writeFileSync(join(out, 'screenshots', target), png);
+    writeFileSync(join(out, 'screenshots', target), shot);
     unlinkSync(join(out, 'screenshots', name));
     shots.push(target);
   } else {

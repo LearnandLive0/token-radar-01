@@ -15,6 +15,8 @@ import {
   farmSteps,
   fitCurve,
   fitPoints,
+  flipFeeTarget,
+  flipValueTarget,
   gasUsd,
   growthMult,
   holdDaysFor,
@@ -23,6 +25,7 @@ import {
   isRankable,
   maturityMult,
   ols,
+  planFor,
   setAsideReason,
   stepText,
   stopRuleFor,
@@ -262,18 +265,111 @@ describe('the farm economics', () => {
     assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: -20 })), { pct: 35, level: 65_000_000 });
     assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: null })), { pct: 20, level: 80_000_000 });
   });
-  test('stepText pads a short step and truncates a long one', () => {
-    assert.ok(stepText({ text: 'Do it.', cost: '$1', time: '1 minute' }).length >= 20);
-    const long = stepText({ text: 'x'.repeat(700), cost: '$1', time: '1 minute' });
+  test('stepText renders a structured step and truncates a long one', () => {
+    const s = stepText({ day: 1, action: 'Do it.', where: 'Test', amount: '$0', cost: '$1', time: '1 minute' });
+    assert.ok(s.startsWith('Day 1 — Do it.'));
+    assert.ok(s.includes('Cost: $1. Time: 1 minute.'));
+    assert.ok(s.length >= 20);
+    const long = stepText({ day: 1, action: 'x'.repeat(700), where: 'Test', amount: '$0', cost: '$1', time: '1 minute' });
     assert.ok(long.length <= 600 && long.endsWith('...'));
   });
   test('farmSteps are seven dated steps, verdict first, with a stop rule', () => {
-    const e = farmEcon(protocol({ chains: ['arbitrum'] }), 10_000_000, 400);
-    const steps = farmSteps(protocol({ chains: ['arbitrum'] }), e, 400);
+    const p = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    const e = farmEcon(p, 50_000_000, 400);
+    const steps = farmSteps(p, e, 400, 50_000_000);
     assert.equal(steps.length, 7);
-    assert.ok(steps[0].startsWith('Verdict: SKIP'));
-    assert.ok(steps.some((s) => s.includes('stop')));
+    assert.ok(steps[0].includes('Verdict: FARM'));
+    assert.ok(steps.some((s) => s.includes('Stop:')));
     for (const s of steps) assert.ok(s.length >= 20 && s.length <= 600, s);
+  });
+});
+
+describe('the farm plans', () => {
+  test('planFor returns seven structured steps with day, action, place, amount, cost and time', () => {
+    const p = protocol({ chains: ['arbitrum'] });
+    const e = farmEcon(p, 10_000_000, 400);
+    const plan = planFor(p, e, 400, 10_000_000);
+    assert.equal(plan.length, 7);
+    for (const s of plan) {
+      assert.ok(typeof s.day === 'number' && s.day >= 1);
+      assert.ok(s.action.length > 0 && s.where.length > 0 && s.amount.length > 0);
+      assert.ok(s.cost.length > 0 && s.time.length > 0);
+    }
+    assert.ok(plan[0].action.startsWith('Verdict: SKIP'));
+    assert.deepEqual(plan.map((s) => s.day), [1, 1, 1, 1, 7, 30, 30]);
+  });
+  test('a FARM plan names the deposit, chain and protocol on day 1', () => {
+    const p = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    const e = farmEcon(p, 50_000_000, 400);
+    assert.equal(e.verdict, 'FARM');
+    const plan = planFor(p, e, 400, 50_000_000);
+    assert.ok(plan[2].action.includes('$5,000'));
+    assert.ok(plan[2].where.includes('arbitrum'));
+    assert.ok(plan[2].amount.startsWith('$5,000'));
+    assert.equal(plan[2].day, 1);
+    assert.ok(plan[4].action.includes('running 400 days with no token'));
+  });
+  test('a THIN plan is a probe: same numbers as econ, no extra capital', () => {
+    const p = protocol({ tvl_usd: 50_000_000, chains: ['arbitrum'] });
+    const e = farmEcon(p, 10_000_000, 400);
+    assert.equal(e.verdict, 'THIN');
+    approx(e.breakEvenOdds, 0.1744, 0.001);
+    const plan = planFor(p, e, 400, 10_000_000);
+    assert.ok(plan[0].action.includes('probe only'));
+    assert.ok(plan[2].action.includes('Probe only'));
+    assert.ok(plan[2].amount.startsWith('$5,000'));
+    assert.ok(plan[4].action.includes('do not add capital'));
+  });
+  test('a SKIP plan carries no deposit step and states its flip conditions', () => {
+    const p = protocol({ chains: ['arbitrum'] });
+    const e = farmEcon(p, 10_000_000, 400);
+    assert.equal(e.verdict, 'SKIP');
+    const steps = farmSteps(p, e, 400, 10_000_000);
+    assert.equal(steps.length, 7);
+    for (const s of steps.slice(1)) assert.ok(!/(deposit|supply|stake|mint|provide|bridge|fund) \$\d/i.test(s), s);
+    const plan = planFor(p, e, 400, 10_000_000);
+    assert.ok(plan[2].action.includes('Flip:'));
+    assert.ok(plan[2].action.includes('would need to reach $'));
+    const target = flipValueTarget(p, e);
+    assert.ok(target > 10_000_000);
+    assert.ok(plan[2].amount.includes(target.toLocaleString('en-US')));
+    // Fees $1.00, capital $16.44, slice $50: even free gas leaves 16.4% odds, above the 10% line.
+    assert.ok(plan[3].action.includes('even free transactions'));
+  });
+  test('flip targets derive from econ: V* pays at 10% odds, F* is the fee ceiling', () => {
+    const p = protocol({ chains: ['arbitrum'] });
+    const e = farmEcon(p, 10_000_000, 400);
+    const target = flipValueTarget(p, e);
+    const sliceAt = (0.1 * target * e.deposit) / p.tvl_usd;
+    approx((e.fees + e.capitalCost) / sliceAt, 0.1, 0.001);
+    // Fees $1.00, capital $16.44, slice $50: 0.1 x 50 - 16.44 < 0, so even free gas does not pay.
+    assert.equal(flipFeeTarget(p, e), null);
+    // Dear chain, rich multiple: slice $250, capital $16.44, so fees would need to fall to $8.56.
+    const dear = protocol({ tvl_usd: 10_000_000, chains: ['ethereum'] });
+    const ed = farmEcon(dear, 5_000_000, 400);
+    assert.equal(ed.verdict, 'THIN');
+    approx(flipFeeTarget(dear, ed), 8.56, 0.01);
+    assert.ok(flipFeeTarget(dear, ed) < ed.fees);
+  });
+  test('ten sampled rows share almost no plan text once the name is stripped', (t) => {
+    if (!existsSync(realSnapshotPath)) {
+      t.skip('kit snapshot not present');
+      return;
+    }
+    const snap = parseSnapshot(readFileSync(realSnapshotPath, 'utf8'));
+    const fit = fitCurve(snap);
+    const { rows } = buildBoard(snap, fit);
+    const sample = [0, 22, 44, 66, 88, 110, 132, 154, 176, 198].map((i) => rows[i]);
+    const texts = sample.map((r) => farmSteps(r, r.econ, r.age_days, r.implied_value_usd).join('\n').split(r.name).join(''));
+    let identical = 0;
+    let pairs = 0;
+    for (let i = 0; i < texts.length; i++) {
+      for (let j = i + 1; j < texts.length; j++) {
+        pairs++;
+        if (texts[i] === texts[j]) identical++;
+      }
+    }
+    assert.ok(identical / pairs < 0.2, `${identical} of ${pairs} pairs identical`);
   });
 });
 
