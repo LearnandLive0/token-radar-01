@@ -204,13 +204,26 @@ if (age < 180) return 60;
 if (age < 365) return 45;
 return 30;
 }
+// Hands-on minutes: setup 30 + 15 min/week x weeks + exit 30; the step times sum to this.
+export function planMinutes(hold) {
+return 30 + (15 * hold) / 7 + 30;
+}
+// E3: funding asset by category + chain (BTC -> BTC, staking -> native coin, else USDC).
+const C2_NATIVE = { solana: 'SOL', ethereum: 'ETH', ton: 'TON', bitcoin: 'BTC', 'hyperliquid l1': 'HYPE', sui: 'SUI', near: 'NEAR', tron: 'TRX', starknet: 'STRK', algorand: 'ALGO', stacks: 'STX' };
+export function fundingAssetFor(p, chain) {
+const c = (p.category || '').toLowerCase();
+if (c.includes('btc')) return { asset: 'BTC', bridge: (chain || '').toLowerCase() === 'bitcoin' ? 0 : gasUsd(chain) };
+if (c.includes('stak')) return { asset: C2_NATIVE[(chain || '').toLowerCase()] || null, bridge: 0 };
+return { asset: 'USDC', bridge: 0 };
+}
 export function farmEcon(p, implied, age) {
 const { chain, gasUsd: gas } = cheapestChain(p);
 const hold = holdDaysFor(age);
+const fa = fundingAssetFor(p, chain);
 const perDollar = p.tvl_usd > 0 ? (ECON.airdrop_share * implied) / p.tvl_usd - ECON.t_bill * (hold / 365) : -1;
 const deposit = perDollar > 0 ? ECON.deposit_max : ECON.deposit_min;
 const slice = p.tvl_usd > 0 ? ECON.airdrop_share * implied * (deposit / p.tvl_usd) : 0;
-const fees = gas * ECON.tx_count;
+const fees = gas * ECON.tx_count + fa.bridge;
 const capitalCost = deposit * ECON.t_bill * (hold / 365);
 const net = slice - fees - capitalCost;
 const costs = fees + capitalCost;
@@ -232,12 +245,16 @@ verdict,
 perHour: round2(net / hours),
 minDeposit,
 activeHours: round2(hours),
+fundingAsset: fa.asset,
 };
+}
+export function gridNet(e, p, d) {
+const s = p / ECON.deposit_max;
+return round2((1 - d) * e.slice * s - e.fees - e.capitalCost * s);
 }
 export function stepText(step) {
 let s = `Day ${step.day} — ${step.action} Where: ${step.where}. Amount: ${step.amount}. Cost: ${step.cost}. Time: ${step.time}.`;
 if (s.length > 600) s = `${s.slice(0, 596)}...`;
-if (s.length < 20) s = `${s} Hold the position and check the protocol's own page.`;
 return s;
 }
 function depositAction(p, econ) {
@@ -262,14 +279,14 @@ function weeklyAction(p, verdict) {
 const c = (p.category || '').toLowerCase();
 const name = p.name;
 if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'Borrow a small amount against the supply and repay it within the week, so the loan counts as activity.';
-if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return "Move the liquidity into the pool's highest-fee range once, then leave it alone.";
-if (c.includes('bridge')) return 'Use the bridged funds in the destination app once, then bridge a small amount back.';
-if (c.includes('staking') || c.includes('restak')) return `Restake the receipt once through ${name}'s restaking vault.`;
-if (c.includes('perpetual') || c.includes('derivative')) return 'Check the funding rate once and keep the hedge near delta-neutral.';
+if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return "Move the liquidity into the pool's highest-fee range when it drifts.";
+if (c.includes('bridge')) return 'Use the bridged funds in the destination app; bridge a small amount back weekly.';
+if (c.includes('staking') || c.includes('restak')) return `Restake the receipt through ${name}'s restaking vault when a reward lands.`;
+if (c.includes('perpetual') || c.includes('derivative')) return 'Check the funding rate weekly and keep the hedge near delta-neutral.';
 if (c.includes('prediction')) return 'Settle the position before the market closes and place the next one.';
-if (c.includes('curator') || c.includes('allocator')) return "Rebalance into the vault's newest strategy once.";
+if (c.includes('curator') || c.includes('allocator')) return "Rebalance into the vault's newest strategy when it changes.";
 if (c.includes('stable')) return 'Hold the minted asset through one full rewards epoch.';
-if (c.includes('rwa')) return verdict === 'THIN' ? 'Claim the yield distribution once and hold it as cash.' : 'Claim the yield distribution once and redeposit it.';
+if (c.includes('rwa')) return verdict === 'THIN' ? 'Claim the yield distribution and hold it as cash.' : 'Claim the yield distribution and redeposit it.';
 if (c.includes('insurance')) return 'File no claim; renew the cover before it lapses.';
 return 'Make one qualifying action, such as a deposit, a borrow, a swap or a vote.';
 }
@@ -305,7 +322,10 @@ if (pct < 0.001) return 'under 0.001% of TVL';
 return `${pct.toFixed(3)}% of TVL`;
 }
 function toSteps(list) {
-return list.map(function (s) { return { day: s[0], action: s[1], where: s[2], amount: s[3], cost: s[4], time: s[5] }; });
+return list.map(function (s) { return { day: s[0], action: s[1], where: s[2], amount: s[3], cost: s[4], time: s[5], mins: s[6] }; });
+}
+export function planTotalMinutes(steps) {
+return steps.reduce(function (a, s) { return a + (s.mins || 0); }, 0);
 }
 export function planFor(p, econ, age, implied) {
 const chain = econ.chain;
@@ -313,6 +333,11 @@ const gas = econ.gasUsd;
 const hold = econ.holdDays;
 const midway = Math.max(7, Math.round(hold / 2));
 const stop = stopRuleFor(p);
+const weeklyTime = '15 minutes × ' + (hold / 7).toFixed(1) + ' weeks';
+const isFarm = econ.verdict === 'FARM';
+// FARM-only Verify/Claim (5 each) move to wallet 5->10, exit 10->15 on THIN.
+const walletMins = isFarm ? 5 : 10;
+const exitMins = isFarm ? 10 : 15;
 const d = econ.deposit.toLocaleString('en-US');
 const net = econ.net < 0 ? '−$' + Math.abs(econ.net).toFixed(2) : '$' + econ.net.toFixed(2);
 const odds = oddsDisplay(econ.breakEvenOdds);
@@ -327,13 +352,13 @@ const verdictLine = econ.minDeposit === null
 : `Verdict: SKIP — expected net ${net} on a $${d} deposit, but break-even odds ${odds} exceed the 25% THIN threshold (minimum paying deposit $${minDep}).`;
 const now = implied === null || implied === undefined ? '' : ` (now $${implied.toLocaleString('en-US')})`;
 return toSteps([
-[1, verdictLine, p.name, `$${d} deposit`, '—', '1 minute'],
-[1, 'No wallet, no funds: watch only until a flip condition is met.', p.name, '$0', '—', '1 minute'],
-[1, target === null ? 'Flip: the numbers give no target value; recheck the inputs.' : `Flip: the implied value would need to reach $${target.toLocaleString('en-US')}${now} for a $${d} deposit to pay at 10% odds.`, p.name, target === null ? '—' : `$${target.toLocaleString('en-US')}`, '—', '2 minutes'],
-[1, feeTarget === null ? 'Flip: even free transactions would not pay at this value; only a higher implied value flips it.' : `Flip: fees would need to fall to $${feeTarget} (now $${econ.fees.toFixed(2)}) at the current value.`, chain, feeTarget === null ? '—' : `$${feeTarget}`, '—', '2 minutes'],
-[7, 'Recheck the TVL and the implied value; if either rose, re-run the numbers.', p.name, '—', '—', '5 minutes'],
-[hold, 'Do not deposit: at the current value every dollar in pays less than the fees.', p.name, '$0', '—', '1 minute'],
-[hold, 'Log the value, TVL and date; compare on the next check.', p.name, '—', '—', '5 minutes'],
+[1, verdictLine, p.name, `$${d} deposit`, '$0.00', '5 minutes', 5],
+[1, 'No wallet, no funds: watch only until a flip condition is met.', p.name, '$0', '$0.00', '5 minutes', 5],
+[1, target === null ? 'Flip: the numbers give no target value; recheck the inputs.' : `Flip: the implied value would need to reach $${target.toLocaleString('en-US')}${now} for a $${d} deposit to pay at 10% odds.`, p.name, target === null ? '—' : `$${target.toLocaleString('en-US')}`, '$0.00', '10 minutes', 10],
+[1, feeTarget === null ? 'Flip: even free transactions would not pay at this value; only a higher implied value flips it.' : `Flip: fees would need to fall to $${feeTarget} (now $${econ.fees.toFixed(2)}) at the current value.`, chain, feeTarget === null ? '—' : `$${feeTarget}`, '$0.00', '10 minutes', 10],
+[7, 'Recheck the TVL and the implied value; if either rose, re-run the numbers.', p.name, '—', '$0.00', weeklyTime, (15 * hold) / 7],
+[hold, 'Do not deposit: at the current value every dollar in pays less than the fees.', p.name, '$0', '$0.00', '15 minutes', 15],
+[hold, 'Log the value, TVL and date; compare on the next check.', p.name, '—', '$0.00', '15 minutes', 15],
 ]);
 }
 const isRwa = (p.category || '').toLowerCase().includes('rwa');
@@ -342,15 +367,18 @@ const verdictLine = econ.verdict === 'FARM'
 : `Verdict: THIN — expected net ${net} on a $${d} deposit, break-even odds ${odds}; probe only, one position, no top-ups.`;
 const ageNote = age === null || age === undefined ? 'age unknown' : `running ${age} days with no token`;
 const probe = econ.verdict === 'THIN' ? ' Probe only: do not add capital.' : '';
-return toSteps([
-[1, verdictLine, p.name, `$${d} deposit`, '—', '1 minute'],
-[1, 'Open a fresh wallet holding only the funds for this farm; keep the seed phrase offline.', chain, '—', `$${gas} of gas (wallet setup)`, '5 minutes'],
-[isRwa ? 3 : 1, depositAction(p, econ) + probe, chain, `$${d} (${poolShare(p, econ)})`, `$${gas} of gas (deposit)`, '15 minutes'],
-[7, weeklyAction(p, econ.verdict), chain, `$${d} stays in the position`, `$${gas} of gas`, '10 minutes'],
-[midway, `Recheck: ${growthClause(p)}; ${ageNote}; if the move reversed, re-run the numbers before staying.${econ.verdict === 'THIN' ? ' Decide whether to exit or hold; do not add capital.' : ''}`, p.name, `$${d} stays in the position`, '—', '10 minutes'],
-[hold, `Stop: if TVL falls ${stop.pct}% from entry (below $${stop.level.toLocaleString('en-US')}), unwind the position the same day and keep the log.`, chain, `$${d}`, 'no fee to watch', '2 minutes a day'],
-[hold, `Withdraw the $${d} and log wallet, dates and every transaction.`, p.name, `$${d}`, `$${gas} of gas to exit`, '15 minutes'],
-]);
+const dep = depositAction(p, econ).replace(/of USDC|of the chain's staking asset/, 'of ' + (econ.fundingAsset || "the chain's staking asset"));
+const s = [
+[1, verdictLine, p.name, `$${d} deposit`, '$0.00', '5 minutes', 5],
+[1, 'Open a fresh wallet holding only the funds for this farm; keep the seed phrase offline.', chain, '—', `$${gas} of gas (wallet setup)`, walletMins + ' minutes', walletMins],
+[isRwa ? 3 : 1, dep + probe, chain, `$${d} (${poolShare(p, econ)})`, `$${gas} of gas (deposit)`, '15 minutes', 15],
+[7, weeklyAction(p, econ.verdict), chain, `$${d} stays in the position`, `$${gas} of gas`, weeklyTime, (15 * hold) / 7],
+[midway, `Recheck: ${growthClause(p)}; ${ageNote}; if the move reversed, re-run the numbers before staying.${econ.verdict === 'THIN' ? ' Decide whether to exit or hold; do not add capital.' : ''}`, p.name, `$${d} stays in the position`, '$0.00', '10 minutes', 10],
+[hold, `Stop: if TVL falls ${stop.pct}% from entry (below $${stop.level.toLocaleString('en-US')}), unwind the position the same day and keep the log. If the protocol pauses withdrawals, wait and recheck weekly; unwind once they resume. A stop is a plan, not a guarantee.`, chain, `$${d}`, '$0.00', '5 minutes', 5],
+[hold, `Withdraw the $${d} and log wallet, dates and every transaction.`, p.name, `$${d}`, `$${gas} of gas to exit`, exitMins + ' minutes', exitMins],
+];
+if (econ.verdict === 'FARM') { s.splice(2, 0, [1, 'Verify: check contract and audit on the explorer; confirm no token yet (5 min, no transaction).', chain, '—', '$0.00', '5 minutes', 5]); s.splice(7, 0, [hold, 'Claim (only if an airdrop is announced): only via the official site; never sign a message link (5 min; claiming costs gas, not in plan fees).', p.name, '$0', '$0.00', '5 minutes', 5]); }
+return toSteps(s);
 }
 export function farmSteps(p, econ, age, implied) {
 return planFor(p, econ, age, implied).map(stepText);

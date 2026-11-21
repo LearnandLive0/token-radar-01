@@ -17,7 +17,9 @@ import {
   fitPoints,
   flipFeeTarget,
   flipValueTarget,
+  fundingAssetFor,
   gasUsd,
+  gridNet,
   growthMult,
   holdDaysFor,
   impliedValue,
@@ -26,6 +28,7 @@ import {
   maturityMult,
   ols,
   planFor,
+  planMinutes,
   setAsideReason,
   stepText,
   stopRuleFor,
@@ -33,6 +36,7 @@ import {
 } from '../dashboard/model.js';
 import { boardIssue, buildBoard, buildRadar, dataScript, liveRows, parseSnapshot, radarRow } from '../lib/board.ts';
 import { bootstrapRefits, looCheck, rankCorr, timeSplitCheck } from '../lib/validate.ts';
+import { checkDetailDom, checkDetailRow, costOfStepText } from '../tools/shot-check.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const realSnapshotPath = join(here, '..', '..', 'token-radar-01-kit', 'input', 'snapshot.json');
@@ -260,6 +264,68 @@ describe('the farm economics', () => {
     assert.equal(e.verdict, 'FARM');
     assert.ok(e.net > 0 && e.perHour > 0);
   });
+  test('planMinutes allocates the model time budget: 30 setup + 15 min/week + 30 exit', () => {
+    approx(planMinutes(30), 124.29, 0.01);
+    approx(planMinutes(45), 156.43, 0.01);
+    approx(planMinutes(60), 188.57, 0.01);
+  });
+  test('step minutes sum to planMinutes and match activeHours within 2 minutes (hours-consistency)', () => {
+    const check = (p, implied, age) => {
+      const e = farmEcon(p, implied, age);
+      const plan = planFor(p, e, age, implied);
+      const sum = plan.reduce((a, s) => a + (s.mins || 0), 0);
+      approx(sum, planMinutes(e.holdDays), 0.01);
+      assert.ok(Math.abs(sum - e.activeHours * 60) <= 2, `step sum ${sum} vs hours ${e.activeHours * 60}`);
+      for (const s of plan) assert.ok(typeof s.mins === 'number' && s.mins > 0, s.time);
+      assert.ok(!plan.some((s) => /a day/.test(s.time)), 'no rate-style step times');
+    };
+    const farmP = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    check(farmP, 50_000_000, 400);
+    const thinP = protocol({ tvl_usd: 50_000_000, chains: ['arbitrum'] });
+    check(thinP, 10_000_000, 400);
+    const skipP = protocol({ chains: ['arbitrum'] });
+    check(skipP, 10_000_000, 400);
+    const farm = planFor(farmP, farmEcon(farmP, 50_000_000, 400), 400, 50_000_000);
+    assert.equal(farm.find((s) => s.action.startsWith('Verify:')).time, '5 minutes');
+    assert.equal(farm.find((s) => s.action.startsWith('Claim')).time, '5 minutes');
+    assert.ok(farm.find((s) => s.time.includes('×')).time.startsWith('15 minutes ×'));
+  });
+  test('farmEcon activeHours and perHour follow the B-prime formula (0.5h + 0.25h/week + 0.5h)', () => {
+    const p = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    const e = farmEcon(p, 50_000_000, 400);
+    assert.equal(e.verdict, 'FARM');
+    assert.equal(e.holdDays, 30);
+    assert.equal(e.activeHours, 2.07);
+    approx(e.perHour, e.net / (0.5 + (30 / 7) * 0.25 + 0.5), 0.02);
+    assert.ok(e.perHour > 900);
+  });
+  test('fundingAssetFor names the funding asset by category and chain (E3)', () => {
+    const btc = protocol({ category: 'BTC', chains: ['bitcoin'] });
+    assert.deepEqual(fundingAssetFor(btc, 'Bitcoin'), { asset: 'BTC', bridge: 0 });
+    const btcOff = protocol({ category: 'BTC', chains: ['ethereum'] });
+    assert.equal(fundingAssetFor(btcOff, 'Ethereum').asset, 'BTC');
+    assert.ok(fundingAssetFor(btcOff, 'Ethereum').bridge > 0);
+    const stak = protocol({ category: 'Liquid Staking', chains: ['solana'] });
+    assert.equal(fundingAssetFor(stak, 'Solana').asset, 'SOL');
+    assert.equal(fundingAssetFor(stak, 'Solana').bridge, 0);
+    const stakUnknown = protocol({ category: 'Liquid Staking', chains: ['fraxtal'] });
+    assert.equal(fundingAssetFor(stakUnknown, 'Fraxtal').asset, null);
+    const dex = protocol({ category: 'Dexs', chains: ['solana'] });
+    assert.deepEqual(fundingAssetFor(dex, 'Solana'), { asset: 'USDC', bridge: 0 });
+    // The deposit step names the native coin on staking rows, and the bridge fee is 0 on-board.
+    const e = farmEcon(stak, 50_000_000, 400);
+    const plan = planFor(stak, e, 400, 50_000_000);
+    assert.ok(plan.some((s) => s.action.includes('of SOL through')), plan.map((s) => s.action).join(' | '));
+    assert.equal(e.fundingAsset, 'SOL');
+  });
+  test('gridNet derives net from econ: slice and capital scale with deposit, fees fixed', () => {
+    const p = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    const e = farmEcon(p, 50_000_000, 400);
+    assert.equal(gridNet(e, 5000, 0), e.net);
+    assert.equal(gridNet(e, 5000, 0.2), Math.round((0.8 * e.slice - e.fees - e.capitalCost) * 100) / 100);
+    assert.equal(gridNet(e, 1000, 0), Math.round((0.2 * e.slice - e.fees - 0.2 * e.capitalCost) * 100) / 100);
+    assert.ok(gridNet(e, 10000, 0) > gridNet(e, 5000, 0));
+  });
   test('stopRuleFor is twice the seven-day swing, clamped to 10-35%', () => {
     assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: 5 })), { pct: 10, level: 90_000_000 });
     assert.deepEqual(stopRuleFor(protocol({ tvl_usd: 100_000_000, change_7d: -20 })), { pct: 35, level: 65_000_000 });
@@ -273,12 +339,14 @@ describe('the farm economics', () => {
     const long = stepText({ day: 1, action: 'x'.repeat(700), where: 'Test', amount: '$0', cost: '$1', time: '1 minute' });
     assert.ok(long.length <= 600 && long.endsWith('...'));
   });
-  test('farmSteps are seven dated steps, verdict first, with a stop rule', () => {
+  test('farmSteps are nine dated steps on FARM, verdict first, with Verify, Claim and a stop rule', () => {
     const p = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
     const e = farmEcon(p, 50_000_000, 400);
     const steps = farmSteps(p, e, 400, 50_000_000);
-    assert.equal(steps.length, 7);
+    assert.equal(steps.length, 9);
     assert.ok(steps[0].includes('Verdict: FARM'));
+    assert.ok(steps.some((s) => s.includes('Verify:')));
+    assert.ok(steps.some((s) => s.includes('Claim (only if')));
     assert.ok(steps.some((s) => s.includes('Stop:')));
     for (const s of steps) assert.ok(s.length >= 20 && s.length <= 600, s);
   });
@@ -303,11 +371,11 @@ describe('the farm plans', () => {
     const e = farmEcon(p, 50_000_000, 400);
     assert.equal(e.verdict, 'FARM');
     const plan = planFor(p, e, 400, 50_000_000);
-    assert.ok(plan[2].action.includes('$5,000'));
-    assert.ok(plan[2].where.includes('arbitrum'));
-    assert.ok(plan[2].amount.startsWith('$5,000'));
-    assert.equal(plan[2].day, 1);
-    assert.ok(plan[4].action.includes('running 400 days with no token'));
+    assert.ok(plan[3].action.includes('$5,000'));
+    assert.ok(plan[3].where.includes('arbitrum'));
+    assert.ok(plan[3].amount.startsWith('$5,000'));
+    assert.equal(plan[3].day, 1);
+    assert.ok(plan[5].action.includes('running 400 days with no token'));
   });
   test('a THIN plan is a probe: same numbers as econ, no extra capital', () => {
     const p = protocol({ tvl_usd: 50_000_000, chains: ['arbitrum'] });
@@ -335,6 +403,18 @@ describe('the farm plans', () => {
     assert.ok(plan[2].amount.includes(target.toLocaleString('en-US')));
     // Fees $1.00, capital $16.44, slice $50: even free gas leaves 16.4% odds, above the 10% line.
     assert.ok(plan[3].action.includes('even free transactions'));
+  });
+  test('plan step costs sum to econ.fees (FARM/THIN) or $0.00 (SKIP)', () => {
+    const sumCosts = (plan) => plan.reduce((sum, s) => {
+      const m = /^\$([\d.]+)/.exec(s.cost);
+      return sum + (m ? Number(m[1]) : 0);
+    }, 0);
+    const farmP = protocol({ tvl_usd: 12_000_000, chains: ['arbitrum'] });
+    const farmE = farmEcon(farmP, 50_000_000, 400);
+    assert.equal(sumCosts(planFor(farmP, farmE, 400, 50_000_000)), farmE.fees);
+    const skipP = protocol({ chains: ['arbitrum'] });
+    const skipE = farmEcon(skipP, 10_000_000, 400);
+    assert.equal(sumCosts(planFor(skipP, skipE, 400, 10_000_000)), 0);
   });
   test('flip targets derive from econ: V* pays at 10% odds, F* is the fee ceiling', () => {
     const p = protocol({ chains: ['arbitrum'] });
@@ -396,7 +476,7 @@ describe('the board', () => {
     for (let i = 1; i < rows.length; i++) assert.ok(rows[i].implied_value_usd <= rows[i - 1].implied_value_usd);
     for (const r of rows) {
       assert.ok(['FARM', 'THIN', 'SKIP'].includes(r.verdict));
-      assert.equal(r.farm_steps.length, 7);
+      assert.equal(r.farm_steps.length, r.verdict === 'FARM' ? 9 : 7);
     }
   });
   test('buildBoard flags above-floor rows that are not on the watchlist', () => {
@@ -582,5 +662,92 @@ describe('the sealed snapshot (integration, skipped when the kit is absent)', ()
       r.rank_hi = b.rank_hi;
     }
     assert.equal(boardIssue(board, snap), null);
+  });
+});
+
+describe('the detail-shot gate (tools/shot-check.mjs)', () => {
+  // Step texts in the exact board.json format: "... Amount: X. Cost: Y. Time: Z."
+  const farmSteps = [
+    'Day 1 — Verdict: FARM — expected net $238.68 on a $5,000 deposit, break-even odds 7.2%. Where: Manifest Trade. Amount: $5,000 deposit. Cost: $0.00. Time: 5 minutes.',
+    'Day 1 — Open a fresh wallet holding only the funds for this farm; keep the seed phrase offline. Where: Solana. Amount: —. Cost: $0.5 of gas (wallet setup). Time: 5 minutes.',
+    'Day 1 — Provide $5,000 of liquidity to Manifest Trade\'s main pool on Solana and keep the position open. Where: Solana. Amount: $5,000 (0.055% of TVL). Cost: $0.5 of gas (deposit). Time: 15 minutes.',
+    'Day 7 — Move the liquidity into the pool\'s highest-fee range when it drifts. Where: Solana. Amount: $5,000 stays in the position. Cost: $0.5 of gas. Time: 15 minutes × 4.3 weeks.',
+    'Day 15 — Recheck: TVL moved +73.7% in 7 days; running 731 days with no token; if the move reversed, re-run the numbers before staying. Where: Manifest Trade. Amount: $5,000 stays in the position. Cost: $0.00. Time: 10 minutes.',
+    'Day 30 — Stop: if TVL falls 35% from entry (below $5,904,668), unwind the position the same day and keep the log. Where: Solana. Amount: $5,000. Cost: $0.00. Time: 5 minutes.',
+    'Day 30 — Withdraw the $5,000 and log wallet, dates and every transaction. Where: Manifest Trade. Amount: $5,000. Cost: $0.5 of gas to exit. Time: 10 minutes.',
+  ];
+  const skipSteps = Array(7).fill('Day 1 — Flip: the implied value would need to reach $64,340,897 for a $500 deposit to pay at 10% odds. Where: Steakhouse Financial. Amount: $64,340,897. Cost: $0.00. Time: 2 minutes.');
+
+  test('costOfStepText extracts the Cost segment', () => {
+    assert.equal(costOfStepText(farmSteps[1]), '$0.5 of gas (wallet setup)');
+    assert.equal(costOfStepText(farmSteps[0]), '$0.00');
+    assert.equal(costOfStepText(farmSteps[5]), '$0.00');
+    assert.equal(costOfStepText('no cost here'), null);
+  });
+
+  test('a FARM row with 7 steps, every step with a $ cost, passes', () => {
+    const g = checkDetailRow({ verdict: 'FARM', farm_steps: farmSteps });
+    assert.equal(g.ok, true);
+    assert.deepEqual(g.failures, []);
+  });
+
+  test('a SKIP row fails on verdict (its $0.00 costs pass the cost check)', () => {
+    const g = checkDetailRow({ verdict: 'SKIP', farm_steps: skipSteps });
+    assert.equal(g.ok, false);
+    assert.ok(g.failures.some((f) => f.includes('verdict is SKIP')));
+    assert.ok(!g.failures.some((f) => f.includes('$ cost steps')));
+  });
+
+  test('a FARM row with 6 steps fails', () => {
+    const g = checkDetailRow({ verdict: 'FARM', farm_steps: farmSteps.slice(0, 6) });
+    assert.equal(g.ok, false);
+    assert.ok(g.failures.some((f) => f.includes('farm_steps 6 < 7')));
+  });
+
+  test('a FARM row with a step missing its $ cost fails', () => {
+    const thin = farmSteps.map((s, i) => (i === 2 || i === 3 ? s.replace(/Cost: \$.*?\. Time:/, 'Cost: —. Time:') : s));
+    const g = checkDetailRow({ verdict: 'FARM', farm_steps: thin });
+    assert.equal(g.ok, false);
+    assert.ok(g.failures.some((f) => f.includes('$ cost steps 5 of 7')));
+  });
+
+  test('a passing DOM measurement passes', () => {
+    const g = checkDetailDom({ dialogOpen: true, verdict: 'FARM', stepRows: 7, dollarCosts: 7, tableBottom: 920, dialogScrollTop: 0, arithPresent: true });
+    assert.equal(g.ok, true);
+  });
+
+  test('each DOM failure is caught', () => {
+    const base = { dialogOpen: true, verdict: 'FARM', stepRows: 7, dollarCosts: 7, tableBottom: 920, dialogScrollTop: 0, arithPresent: true };
+    const cases = [
+      [{ ...base, dialogOpen: false }, 'not open'],
+      [{ ...base, verdict: 'SKIP' }, 'verdict'],
+      [{ ...base, stepRows: 6 }, 'plan rows'],
+      [{ ...base, dollarCosts: 0 }, '$ cost cells'],
+      [{ ...base, dollarCosts: 6 }, '$ cost cells'],
+      [{ ...base, tableBottom: 1050 }, 'exceeds viewport'],
+      [{ ...base, dialogScrollTop: 120 }, 'scrolled'],
+      [{ ...base, arithPresent: false }, 'arithmetic bar'],
+    ];
+    for (const [m, needle] of cases) {
+      const g = checkDetailDom(m);
+      assert.equal(g.ok, false, JSON.stringify(m));
+      assert.ok(g.failures.some((f) => f.includes(needle)), JSON.stringify(g.failures));
+    }
+  });
+
+  test('the real rows: manifest-trade passes, steakhouse-financial fails', (t) => {
+    if (!existsSync(realSnapshotPath)) {
+      t.skip('kit snapshot not present');
+      return;
+    }
+    const snap = parseSnapshot(readFileSync(realSnapshotPath, 'utf8'));
+    const { board } = buildRadar(snap);
+    const manifest = board.find((r) => r.slug === 'manifest-trade');
+    const steakhouse = board.find((r) => r.slug === 'steakhouse-financial');
+    assert.ok(manifest && steakhouse);
+    assert.equal(checkDetailRow(manifest).ok, true);
+    const g = checkDetailRow(steakhouse);
+    assert.equal(g.ok, false);
+    assert.ok(g.failures.some((f) => f.includes('verdict is SKIP')));
   });
 });
